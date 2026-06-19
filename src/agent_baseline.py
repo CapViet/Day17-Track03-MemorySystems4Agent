@@ -16,60 +16,122 @@ class SessionState:
 
 
 class BaselineAgent:
-    """Student TODO: implement Agent A.
+    """Agent A: naive short-term memory only.
 
-    Requirements:
-    - Within-session memory only
-    - No persistent `User.md`
-    - Should forget long-term facts across new threads
+    - remembers within the same thread
+    - has no persistent ``User.md``
+    - forgets long-term facts across new threads (no cross-session recall)
     """
 
     def __init__(self, config: LabConfig | None = None, force_offline: bool = False) -> None:
         self.config = config or load_config()
         self.force_offline = force_offline
         self.sessions: dict[str, SessionState] = {}
-
-        # TODO: optionally initialize a real LangChain/LangGraph agent when dependencies exist.
         self.langchain_agent = None
 
     def reply(self, user_id: str, thread_id: str, message: str) -> dict[str, Any]:
-        """Student TODO: return the agent response and token accounting.
-
-        Pseudocode:
-        - If a live agent exists, call the live path.
-        - Otherwise use a deterministic offline path.
-        """
-
-        raise NotImplementedError
+        if not self.force_offline and self.langchain_agent is not None:
+            return self._reply_live(user_id, thread_id, message)
+        return self._reply_offline(thread_id, message)
 
     def token_usage(self, thread_id: str) -> int:
-        # TODO: return cumulative agent token count for one thread.
-        raise NotImplementedError
+        session = self.sessions.get(thread_id)
+        return session.token_usage if session else 0
 
     def prompt_token_usage(self, thread_id: str) -> int:
-        # TODO: estimate how much prompt context this baseline kept processing.
-        raise NotImplementedError
+        session = self.sessions.get(thread_id)
+        return session.prompt_tokens_processed if session else 0
 
     def compaction_count(self, thread_id: str) -> int:
         # Baseline has no compact memory.
         return 0
 
     def _reply_offline(self, thread_id: str, message: str) -> dict[str, Any]:
-        """Student TODO: implement a simple offline behavior.
+        session = self.sessions.setdefault(thread_id, SessionState())
+        session.messages.append({"role": "user", "content": message})
 
-        Suggested behavior:
-        - Store the new user message in the session
-        - Generate a short deterministic reply
-        - Update token counts
-        - Never remember facts across different thread ids
+        # Baseline naively re-processes the entire thread history every turn.
+        context_text = "\n".join(m["content"] for m in session.messages)
+        prompt_tokens = estimate_tokens(context_text)
+        session.prompt_tokens_processed += prompt_tokens
+
+        reply = self._naive_reply(session, message)
+        session.messages.append({"role": "assistant", "content": reply})
+
+        out_tokens = estimate_tokens(reply)
+        session.token_usage += out_tokens
+
+        return {
+            "reply": reply,
+            "agent_tokens": out_tokens,
+            "prompt_tokens": prompt_tokens,
+            "thread_id": thread_id,
+        }
+
+    def _naive_reply(self, session: SessionState, message: str) -> str:
+        """Deterministic reply that only knows the current thread.
+
+        It never surfaces long-term facts: when asked a recall question in a
+        fresh thread it has nothing stored, which is exactly the baseline's
+        weakness we want the benchmark to expose.
         """
 
-        raise NotImplementedError
+        if message.strip().endswith("?"):
+            # Only this thread's turns are available — no persistent profile.
+            user_turns = [m["content"] for m in session.messages if m["role"] == "user"]
+            if len(user_turns) <= 1:
+                return (
+                    "Trong phiên hiện tại mình chưa được cung cấp thông tin đó, "
+                    "nên mình không nhớ được qua phiên mới."
+                )
+            return (
+                "Mình chỉ nhớ những gì vừa trao đổi trong phiên này, "
+                "không có bộ nhớ dài hạn giữa các phiên."
+            )
+        return "Đã ghi nhận trong phiên hiện tại (không lưu dài hạn)."
 
     def _maybe_build_langchain_agent(self):
-        """Student TODO: optionally wire `create_agent` + `InMemorySaver` here.
+        """Optionally wire a live LangGraph agent with an in-thread checkpointer.
 
-        Use `build_chat_model(self.config.model)` so the baseline can run with any supported provider.
+        Returns None (offline) when dependencies or credentials are missing.
         """
 
-        raise NotImplementedError
+        try:
+            from langchain.agents import create_agent
+            from langgraph.checkpoint.memory import InMemorySaver
+        except Exception:
+            return None
+
+        try:
+            model = build_chat_model(self.config.model)
+        except Exception:
+            return None
+
+        self.langchain_agent = create_agent(
+            model,
+            tools=[],
+            checkpointer=InMemorySaver(),
+            system_prompt=(
+                "Bạn là baseline agent chỉ có short-term memory trong cùng một thread. "
+                "Không có bộ nhớ dài hạn giữa các phiên."
+            ),
+        )
+        return self.langchain_agent
+
+    def _reply_live(self, user_id: str, thread_id: str, message: str) -> dict[str, Any]:
+        result = self.langchain_agent.invoke(
+            {"messages": [{"role": "user", "content": message}]},
+            config={"configurable": {"thread_id": thread_id}},
+        )
+        reply = result["messages"][-1].content
+        session = self.sessions.setdefault(thread_id, SessionState())
+        prompt_tokens = estimate_tokens(message)
+        out_tokens = estimate_tokens(reply)
+        session.prompt_tokens_processed += prompt_tokens
+        session.token_usage += out_tokens
+        return {
+            "reply": reply,
+            "agent_tokens": out_tokens,
+            "prompt_tokens": prompt_tokens,
+            "thread_id": thread_id,
+        }
